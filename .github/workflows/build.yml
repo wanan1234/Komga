@@ -1,0 +1,441 @@
+name: Build Komga fnOS Package
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: '0 8 1 * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (留空自动获取最新)'
+        required: false
+        default: ''
+      revision:
+        description: '修订后缀 (如 r2 用于重新发布)'
+        required: false
+        default: ''
+      bundle_jre:
+        description: '构建模式：内置 JRE（体积大、开箱即用） / 系统 Java（体积小、需先装 Java 21 OpenJDK）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      bundle_jre: ${{ steps.check.outputs.bundle_jre }}
+      suffix: ${{ steps.check.outputs.suffix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Latest Version
+        id: version
+        run: |
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION=$(gh api repos/gotson/komga/releases/latest --jq .tag_name)
+            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+              VERSION=$(curl -sL -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/gotson/komga/releases/latest" | \
+                grep -oE '"tag_name":\s*"[^"]+"' | head -1 | sed 's/.*"tag_name":\s*"//;s/"//')
+            fi
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本: $VERSION"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check Release and Determine Tag
+        id: check
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REVISION="${{ github.event.inputs.revision }}"
+          BUNDLE_JRE="${{ github.event.inputs.bundle_jre }}"
+
+          if [ -z "$BUNDLE_JRE" ]; then
+            BUNDLE_JRE="true"
+          fi
+          echo "bundle_jre=$BUNDLE_JRE" >> $GITHUB_OUTPUT
+
+          if [ "$BUNDLE_JRE" = "true" ]; then
+            SUFFIX="-fnos"
+          else
+            SUFFIX="-fnos-sys"
+          fi
+          echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+
+          if [ -n "$REVISION" ]; then
+            RELEASE_TAG="v${VERSION}${SUFFIX}-${REVISION}"
+          else
+            if gh release view "v${VERSION}${SUFFIX}" &>/dev/null; then
+              HIGHEST_REV=$(gh release list --limit 100 | grep "v${VERSION}${SUFFIX}" | \
+                sed -n 's/.*v'"${VERSION}${SUFFIX}"'-r\([0-9]*\).*/\1/p' | sort -n | tail -1)
+              if [ -n "$HIGHEST_REV" ]; then
+                RELEASE_TAG="v${VERSION}${SUFFIX}-r$((HIGHEST_REV + 1))"
+              else
+                RELEASE_TAG="v${VERSION}${SUFFIX}-r2"
+              fi
+            else
+              RELEASE_TAG="v${VERSION}${SUFFIX}"
+            fi
+          fi
+          if gh release view "$RELEASE_TAG" &>/dev/null; then
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            jre_arch: x64
+            manifest_platform: x86
+          - arch: arm
+            jre_arch: aarch64
+            manifest_platform: arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Official Komga JAR
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          echo "目标版本: $VERSION"
+
+          JAR_URL=$(gh api repos/gotson/komga/releases/tags/${VERSION} \
+            --jq '.assets[] | select(.name | endswith(".jar")) | .browser_download_url' | head -1)
+
+          if [ -z "$JAR_URL" ]; then
+            echo "❌ 无法从 API 获取 JAR URL，列出该 release 的所有 asset："
+            gh api repos/gotson/komga/releases/tags/${VERSION} --jq '.assets[].name' || true
+            exit 1
+          fi
+
+          echo "JAR URL: $JAR_URL"
+          curl -fL -o komga.jar "$JAR_URL"
+          ls -lh komga.jar
+          file komga.jar
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Bundled JRE
+        if: needs.check-version.outputs.bundle_jre == 'true'
+        run: |
+          JRE_ARCH="${{ matrix.jre_arch }}"
+          JRE_URL="https://api.adoptium.net/v3/binary/latest/21/ga/linux/${JRE_ARCH}/jre/hotspot/normal/eclipse"
+          curl -fL -o jre.tar.gz "$JRE_URL"
+          mkdir -p jre
+          tar xzf jre.tar.gz -C jre --strip-components=1
+          echo "JRE: $(du -sh jre)"
+
+      - name: Download fnpack
+        run: |
+          FN_URL="https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64"
+          curl -fL -o fnpack "$FN_URL"
+          if ! file fnpack | grep -q "ELF"; then
+            echo "❌ fnpack 无效"
+            exit 1
+          fi
+          chmod +x fnpack
+
+      - name: Generate official template and populate
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          MANIFEST_PLATFORM="${{ matrix.manifest_platform }}"
+          BUNDLE_JRE="${{ needs.check-version.outputs.bundle_jre }}"
+          SUFFIX="${{ needs.check-version.outputs.suffix }}"
+
+          echo "===== 构建模式: bundle_jre=$BUNDLE_JRE ====="
+
+          rm -rf komga fpk_src
+          ./fnpack create komga 2>&1 | tail -3
+          mv komga fpk_src
+
+          cp fnos/ICON.PNG fpk_src/ICON.PNG
+          cp fnos/ICON_256.PNG fpk_src/ICON_256.PNG
+
+          rm -rf fpk_src/app/bin fpk_src/app/jre
+          find fpk_src/app -maxdepth 1 -type f -delete 2>/dev/null || true
+          mkdir -p fpk_src/app/bin fpk_src/app/config
+          mkdir -p fpk_src/app/ui/images
+
+          cp komga.jar fpk_src/app/bin/komga.jar
+
+          if [ "$BUNDLE_JRE" = "true" ]; then
+            mkdir -p fpk_src/app/jre
+            cp -a jre/* fpk_src/app/jre/
+            echo "已内置 JRE"
+          else
+            echo "跳过 JRE，将使用系统 Java"
+          fi
+
+          # 桌面图标配置
+          cat > fpk_src/app/ui/config << 'UICONF'
+          {
+            ".url": {
+              "komga.main": {
+                "title": "Komga",
+                "icon": "images/icon_{0}.png",
+                "type": "url",
+                "protocol": "http",
+                "port": "25600",
+                "url": "/",
+                "allUsers": true
+              }
+            }
+          }
+          UICONF
+
+          cp fnos/ICON.PNG fpk_src/app/ui/images/icon_64.png
+          cp fnos/ICON_256.PNG fpk_src/app/ui/images/icon_256.png
+
+          # 卸载向导
+          cat > fpk_src/wizard/uninstall << 'WIZUNINSTALL'
+          [
+            {
+              "stepTitle": "卸载确认",
+              "items": [
+                {
+                  "type": "tips",
+                  "field": "",
+                  "label": "",
+                  "rules": [],
+                  "options": [],
+                  "helpText": "卸载 Komga 后，您的漫画数据、配置和下载文件将会被保留。如需彻底清理，请手动删除 /vol1/@appdata/komga 目录。"
+                }
+              ]
+            }
+          ]
+          WIZUNINSTALL
+
+          # Komga 配置文件（YAML 格式，Komga 原生支持 application.yml）
+          cat > fpk_src/app/config/application.yml << 'APPYML'
+          server:
+            port: 25600
+            servlet:
+              context-path: ""
+          komga:
+            config-dir: "${DATA_DIR}"
+          logging:
+            file:
+              name: "${DATA_DIR}/komga.log"
+          APPYML
+
+          # cmd/main
+          cat > fpk_src/cmd/main << 'CMDMAIN'
+          #!/bin/bash
+          APP_DIR="${TRIM_APPDEST}"
+          VAR_DIR="${TRIM_PKGVAR}"
+          TMP_DIR="${TRIM_PKGTMP}"
+          KOMGA_DATA_DIR="${VAR_DIR}"
+          LOG_FILE="${VAR_DIR}/komga.log"
+          PID_FILE="${VAR_DIR}/komga.pid"
+
+          log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+          status() {
+              if [ -f "$PID_FILE" ]; then
+                  local pid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+                  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+              fi
+              return 1
+          }
+          start_process() {
+              if status; then log_msg "Already running"; return 0; fi
+              log_msg "===== 启动 Komga ====="
+              mkdir -p "$KOMGA_DATA_DIR" "$TMP_DIR" 2>/dev/null
+              cd "$APP_DIR" || { log_msg "无法进入 $APP_DIR"; return 1; }
+              export KOMGA_DATA_DIR TRIM_PKGTMP TRIM_APPDEST TRIM_PKGVAR
+              nohup bash "$APP_DIR/komga-server.sh" >> "$LOG_FILE" 2>&1 &
+              local pid=$!
+              echo "$pid" > "$PID_FILE"
+              log_msg "已启动，PID=$pid"
+              sleep 5
+              if kill -0 "$pid" 2>/dev/null; then log_msg "启动成功"; return 0;
+              else log_msg "启动后进程立即退出"; rm -f "$PID_FILE"; return 1; fi
+          }
+          stop_process() {
+              log_msg "停止 Komga"
+              if [ -f "$PID_FILE" ]; then
+                  local pid=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+                  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid"
+                  rm -f "$PID_FILE"
+              fi
+              log_msg "已停止"
+          }
+          case "$1" in
+              start) start_process; exit $? ;;
+              stop) stop_process; exit 0 ;;
+              status) status && exit 0 || exit 3 ;;
+              *) echo "Usage: $0 {start|stop|status}"; exit 1 ;;
+          esac
+          CMDMAIN
+          chmod +x fpk_src/cmd/main
+
+          # komga-server.sh（智能查找 Java，支持内置 JRE 和系统 Java）
+          cat > fpk_src/app/komga-server.sh << 'SERVERSCRIPT'
+          #!/bin/bash
+          APP_DIR="${TRIM_APPDEST}"
+          DATA_DIR="${KOMGA_DATA_DIR}"
+          TMP_DIR="${TRIM_PKGTMP}"
+          [ -z "$APP_DIR" ] || [ ! -d "$APP_DIR" ] && APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+          [ -z "$DATA_DIR" ] && DATA_DIR="/vol1/@appdata/komga"
+          [ -z "$TMP_DIR" ] && TMP_DIR="$DATA_DIR/tmp"
+
+          JAR_FILE="$APP_DIR/bin/komga.jar"
+          LOG_FILE="$DATA_DIR/komga.log"
+          mkdir -p "$DATA_DIR" "$TMP_DIR" 2>/dev/null
+
+          echo "===== $(date) 启动 Komga =====" >> "$LOG_FILE"
+
+          JAVA_BIN=""
+          if [ -x "$APP_DIR/jre/bin/java" ]; then
+              JAVA_BIN="$APP_DIR/jre/bin/java"
+              echo "$(date) 使用内置 JRE" >> "$LOG_FILE"
+          else
+              echo "$(date) 未找到内置 JRE，自动扫描系统 Java 21..." >> "$LOG_FILE"
+              for java_bin in \
+                  /vol1/@appcenter/*/bin/java \
+                  /vol1/@appcenter/*/jre/bin/java \
+                  /vol1/@appcenter/*/jdk/bin/java \
+                  /usr/local/bin/java \
+                  /usr/bin/java \
+                  /opt/java/openjdk/bin/java \
+                  /opt/openjdk-21/bin/java ; do
+                  if [ -x "$java_bin" ]; then
+                      VERSION_OUT=$("$java_bin" -version 2>&1 | head -1)
+                      echo "$(date) 检查 $java_bin -> $VERSION_OUT" >> "$LOG_FILE"
+                      if echo "$VERSION_OUT" | grep -qE '"21[\.\"]'; then
+                          JAVA_BIN="$java_bin"
+                          echo "$(date) ✅ 选中 Java: $JAVA_BIN" >> "$LOG_FILE"
+                          break
+                      fi
+                  fi
+              done
+              if [ -z "$JAVA_BIN" ]; then
+                  SYS_JAVA=$(command -v java 2>/dev/null)
+                  if [ -n "$SYS_JAVA" ] && "$SYS_JAVA" -version 2>&1 | grep -qE '"21[\.\"]'; then
+                      JAVA_BIN="$SYS_JAVA"
+                      echo "$(date) ✅ 使用 PATH 中的 Java: $JAVA_BIN" >> "$LOG_FILE"
+                  fi
+              fi
+          fi
+
+          if [ -z "$JAVA_BIN" ] || [ ! -x "$JAVA_BIN" ]; then
+              echo "$(date) ❌ 未找到可用的 Java 21 运行时！" >> "$LOG_FILE"
+              echo "$(date) 请先在飞牛应用中心安装 Java 21 OpenJDK。" >> "$LOG_FILE"
+              exit 1
+          fi
+
+          "$JAVA_BIN" -version >> "$LOG_FILE" 2>&1
+
+          # 复制 application.yml 到数据目录
+          if [ -f "$APP_DIR/config/application.yml" ]; then
+              sed "s|\${DATA_DIR}|$DATA_DIR|g" "$APP_DIR/config/application.yml" > "$DATA_DIR/application.yml"
+          fi
+
+          cd "$DATA_DIR"
+          exec "$JAVA_BIN" -Xmx2048m -Duser.home="$DATA_DIR" -jar "$JAR_FILE" \
+            --spring.config.additional-location="$DATA_DIR/application.yml" \
+            >> "$LOG_FILE" 2>&1
+          SERVERSCRIPT
+          chmod +x fpk_src/app/komga-server.sh
+
+          # 根据模式设置 desc
+          if [ "$BUNDLE_JRE" = "true" ]; then
+            DESC="Komga 是一个开源的漫画、杂志和电子书媒体服务器，支持 API、OPDS、Kobo Sync 和 KOReader Sync。本应用基于 Komga ${VERSION} 官方 JAR 打包，内置 OpenJDK 21 运行时，开箱即用，无需额外依赖。默认端口 25600，数据存储在 /vol1/@appdata/komga。"
+          else
+            DESC="Komga 是一个开源的漫画、杂志和电子书媒体服务器，支持 API、OPDS、Kobo Sync 和 KOReader Sync。本应用基于 Komga ${VERSION} 官方 JAR 打包，软件依赖 Java 21 环境，请先在飞牛应用中心安装 Java 21 OpenJDK。默认端口 25600，数据存储在 /vol1/@appdata/komga。"
+          fi
+
+          sed -i "s|^appname.*|appname               = komga|" fpk_src/manifest
+          sed -i "s|^version.*|version               = ${VERSION}${SUFFIX}|" fpk_src/manifest
+          sed -i "s|^display_name.*|display_name          = Komga|" fpk_src/manifest
+          sed -i "s|^desc.*|desc                  = ${DESC}|" fpk_src/manifest
+          sed -i "s|^service_port.*|service_port          = 25600|" fpk_src/manifest
+          sed -i "s|^platform.*|platform              = ${MANIFEST_PLATFORM}|" fpk_src/manifest
+          sed -i "s|^desktop_applaunchname.*|desktop_applaunchname = komga.main|" fpk_src/manifest
+          sed -i "s|^desktop_uidir.*|desktop_uidir         = ui|" fpk_src/manifest
+          sed -i "s|^maintainer.*|maintainer            = wanan1234|" fpk_src/manifest
+          sed -i "s|^distributor.*|distributor           = wanan1234|" fpk_src/manifest
+          sed -i "s|^source.*|source                = thirdparty|" fpk_src/manifest
+
+          echo "===== 最终 manifest ====="
+          cat fpk_src/manifest
+
+      - name: Build FPK with fnpack
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          SUFFIX="${{ needs.check-version.outputs.suffix }}"
+          ./fnpack build --directory fpk_src
+          BUILT_FPK=""
+          [ -f "./komga.fpk" ] && BUILT_FPK="./komga.fpk"
+          [ -z "$BUILT_FPK" ] && [ -f "./fpk_src/komga.fpk" ] && BUILT_FPK="./fpk_src/komga.fpk"
+          [ -z "$BUILT_FPK" ] && BUILT_FPK=$(find . -maxdepth 2 -name "*.fpk" -type f | head -n 1)
+          if [ -z "$BUILT_FPK" ]; then echo "错误：fnpack 未生成 .fpk 文件！"; exit 1; fi
+          mv "$BUILT_FPK" "komga_${VERSION}${SUFFIX}_${ARCH}.fpk"
+          ls -lh "komga_${VERSION}${SUFFIX}_${ARCH}.fpk"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpk-${{ matrix.arch }}
+          path: komga_${{ needs.check-version.outputs.version }}${{ needs.check-version.outputs.suffix }}_${{ matrix.arch }}.fpk
+          retention-days: 1
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create Release
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          RELEASE_TAG="${{ needs.check-version.outputs.release_tag }}"
+          BUNDLE_JRE="${{ needs.check-version.outputs.bundle_jre }}"
+
+          if [ "$BUNDLE_JRE" = "true" ]; then
+            TITLE="Komga ${VERSION} for fnOS (内置 JRE)"
+            NOTES_EXTRA="内置 OpenJDK 21 运行时，开箱即用。"
+          else
+            TITLE="Komga ${VERSION} for fnOS (系统 Java)"
+            NOTES_EXTRA="需要先在飞牛应用中心安装 **Java 21 OpenJDK**。"
+          fi
+
+          ls -la artifacts/*/
+          gh release create "$RELEASE_TAG" \
+            --title "$TITLE" \
+            --notes "自动构建的 fnOS 安装包
+
+          - 基于 Komga ${VERSION} 官方 JAR
+          - ${NOTES_EXTRA}
+          - 默认端口 25600
+          - 支持 x86 和 ARM 双架构" \
+            artifacts/fpk-x86/*.fpk \
+            artifacts/fpk-arm/*.fpk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
